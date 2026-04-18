@@ -1,0 +1,36 @@
+# CANCER PROGNOSIS SYSTEM - SAMPLE MEDICAL REPORT
+
+## Patient Information
+- **Full Name**: Johnathan Smith
+- **Hospital ID**: HOSP-99231
+- **Age**: 58
+- **Gender**: Male
+
+## Clinical Findings
+- **Tumor Stage**: Stage III
+- **Tumor Grade**: G2
+- **Metastasis**: No
+
+## Genomic Profile
+The following genetic markers were identified and quantified:
+
+| Gene ID          | Expression Value |
+|------------------|------------------|
+| ENSG00000276168.1: 14.522
+| ENSG00000198712.1: 8.910
+| ENSG00000198938.2: 2.345
+| ENSG00000198804.2: 1.102
+| ENSG00000210082.2: 4.567
+| ENSG00000211592.8: 0.892
+| ENSG00000198886.2: 12.110
+| ENSG00000198899.2: 5.670
+| ENSG00000277437.1: 0.123
+| ENSG00000198840.2: 7.890
+
+### Legacy Markers
+- **Gene A**: 15.20
+- **Gene B**: 3.45
+- **Gene C**: 0.92
+
+## Summary
+Patient shows high expression of markers correlated with favorable response to standard therapy. Further molecular analysis recommended for ENSG00000198886.2.

@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Large data files (tracked by DVC or not needed in repo)
+*.tsv
+!target_ready_dataset.tsv
+*.parquet
+*.json
+
+# Model artifacts (tracked by DVC)
+# Uncomment these if using DVC to track models separately:
+# *.pkl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Docker
+*.log
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/build/

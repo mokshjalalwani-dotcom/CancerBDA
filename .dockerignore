@@ -1,0 +1,27 @@
+# Ignored directories
+.git
+.github
+.venv
+__pycache__
+frontend/
+outputs/
+scripts/
+extracted_tsv/
+data/
+clinical/
+
+# Ignored large files that are not needed in production image
+gene_expression_matrix_genes_x_cases.tsv
+gene_expression_patient_level.tsv
+clinical_master.tsv
+clinical_patient_level.tsv
+model_ready_dataset.tsv
+model_training_dataset.tsv
+spark_ready_dataset.parquet
+gdc_sample_sheet.2026-03-15.tsv
+metadata.cart.2026-03-15.json
+patient_ids.tsv
+file_case_mapping.tsv
+gene_list.tsv
+gene_statistics.tsv
+*.pyc

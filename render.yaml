@@ -1,0 +1,20 @@
+services:
+  # 1. Machine Learning API (FastAPI)
+  - type: web
+    name: cancer-ai-api
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+
+  # 2. Premium Frontend Site (Vite Static)
+  - type: static_site
+    name: cancer-ai-frontend
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: VITE_API_BASE_URL
+        value: https://cancer-ai-api-sg4l.onrender.com
