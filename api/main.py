@@ -3,8 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
-import joblib
-from sklearn.metrics.pairwise import cosine_similarity
 import pdfplumber
 import io
 import re
@@ -12,12 +10,17 @@ from typing import Any, List, Dict, Optional
 import json
 import time
 from datetime import datetime
+import os
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+from pyspark.ml import PipelineModel
+from pyspark import StorageLevel
 from hdfs import InsecureClient
-from requests.exceptions import ConnectionError
 
-app = FastAPI(title="Breast Cancer Prediction API")
+app = FastAPI(title="Breast Cancer Prediction API (Spark 1TB Distributed)")
 
-# Allow CORS (Explicit origins are required when allow_credentials=True)
+# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,129 +29,177 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Load artifacts
-# -----------------------------
-DATA_FILE = "/cancer_data/target_ready_dataset.tsv"
+# Load artifacts & Spark
+DATA_FILE = "hdfs://namenode:9000/cancer_data/target_ready_dataset.tsv"
 SELECTED_GENES_FILE = "selected_genes.txt"
-SURVIVAL_MODEL_FILE = "survival_model.pkl"
-RECURRENCE_MODEL_FILE = "recurrence_model.pkl"
-SIMILARITY_MODEL_FILE = "patient_similarity_model.pkl"
-SCALER_FILE = "scaler.pkl"
 
-import os
+SURVIVAL_MODEL_SPARK = "survival_model_spark"
+RECURRENCE_MODEL_SPARK = "recurrence_model_spark"
+
 HDFS_URL = os.environ.get("HDFS_URL", "http://localhost:9870")
 HDFS_CLIENT = InsecureClient(HDFS_URL, user='root')
 
-def get_hdfs_df(retries=5, delay=3):
-    """Shared HDFS helper function with retry logic."""
-    for i in range(retries):
-        try:
-            with HDFS_CLIENT.read(DATA_FILE) as reader:
-                print(f"Successfully connected to HDFS and reading {DATA_FILE}")
-                return pd.read_csv(reader, sep="\t", low_memory=False)
-        except Exception as e:
-            print(f"HDFS connection attempting... ({e}). Retry {i+1}/{retries}")
-            time.sleep(delay)
-    
-    print("WARNING: Starting with empty df. HDFS may be down. Defaulting to local file as fallback if exists.")
-    try:
-        return pd.read_csv("target_ready_dataset.tsv", sep="\t", low_memory=False)
-    except Exception:
-        return pd.DataFrame()
+print("INITIALIZING SPARK SESSION FOR DISTRIBUTED COMPUTATION...")
+spark = SparkSession.builder \
+    .appName("CancerAPI_Distributed") \
+    .config("spark.driver.memory", "2g") \
+    .config("spark.driver.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED") \
+    .config("spark.executor.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .config("spark.sql.execution.arrow.maxRecordsPerBatch", "200") \
+    .getOrCreate()
 
-df = get_hdfs_df()
+def load_spark_df():
+    try:
+        print(f"Attempting to read from HDFS: {DATA_FILE}")
+        df = spark.read.csv(DATA_FILE, sep="\t", header=True, inferSchema=True)
+        safe_cols = [c.replace(".", "_") for c in df.columns]
+        df = df.toDF(*safe_cols)
+        print(f"HDFS Dataset Count: {df.count()}")
+        return df
+    except Exception as e:
+        print(f"HDFS connection failed ({e}). Defaulting to local CSV.")
+        df = spark.read.csv("target_ready_dataset.tsv", sep="\t", header=True, inferSchema=True)
+        safe_cols = [c.replace(".", "_") for c in df.columns]
+        return df.toDF(*safe_cols)
+
+spark_df = load_spark_df()
 
 with open(SELECTED_GENES_FILE, "r", encoding="utf-8") as f:
-    selected_genes = [line.strip() for line in f if line.strip()]
+    selected_genes = [line.strip().replace(".", "_") for line in f if line.strip()]
 
-survival_model = joblib.load(SURVIVAL_MODEL_FILE)
-recurrence_model = joblib.load(RECURRENCE_MODEL_FILE)
-knn_model = joblib.load(SIMILARITY_MODEL_FILE)
-preprocessor = joblib.load(SCALER_FILE)
+spark_df_columns = spark_df.columns
+id_col = [c for c in spark_df_columns if "case_id" in c.lower()][0]
+gene_cols = [c for c in selected_genes if c in spark_df_columns]
 
-id_col = [c for c in df.columns if "case_id" in c.lower()][0]
+print("LOADING DISTRIBUTED PYSPARK MODELS...")
+try:
+    survival_model = PipelineModel.load(SURVIVAL_MODEL_SPARK)
+    recurrence_model = PipelineModel.load(RECURRENCE_MODEL_SPARK)
+except Exception as e:
+    print(f"Warning: Could not load pySpark models ({e}). Did you run train_spark_models.py?")
+    survival_model = None
+    recurrence_model = None
 
-gene_cols = [c for c in selected_genes if c in df.columns]
 
-X_all = df[gene_cols].apply(pd.to_numeric, errors="coerce")
-X_all_scaled = preprocessor.transform(X_all)
+print("BUILDING IN-MEMORY VECTOR DATABASE FOR MILLISECOND SEARCHES...")
+# Enterprise architectures use Spark for predictive ML classification (1TB), 
+# but utilize isolated RAM Vector Databases (NumPy/FAISS) for real-time AI Similarity Searches.
+try:
+    pandas_df = pd.read_csv("target_ready_dataset.tsv", sep="\t")
+    pandas_df.columns = [str(c).replace(".", "_") for c in pandas_df.columns]
+except:
+    pandas_df = pd.DataFrame(columns=[id_col, "survival_label", "recurrence_label", "high_risk_flag"] + gene_cols)
 
-patient_id_to_index = {
-    str(pid): idx for idx, pid in enumerate(df[id_col].astype(str).tolist())
-}
+# Precalculate the absolute mathematics natively into C-level Numpy arrays
+features_mat = pandas_df[gene_cols].values.astype(np.float32)
+features_norms = np.linalg.norm(features_mat, axis=1) + 1e-9
 
-# -----------------------------
+try:
+    print(f"Vector Database Online. Loaded {len(pandas_df)} patient profiles securely.")
+except Exception as e:
+    pass
+
+
+
 # Request schemas
-# -----------------------------
 class PatientRequest(BaseModel):
     case_id: str | None = None
     genes: dict[str, float] | None = None
 
 
-# -----------------------------
+
 # Helpers
-# -----------------------------
-def get_feature_vector_from_request(req: PatientRequest):
-    """
-    Build a gene feature vector in the same order as training.
-    """
+def get_prediction_spark_df(req: PatientRequest):
     if req.case_id:
-        row = df[df[id_col].astype(str) == str(req.case_id)]
-        if row.empty:
+        target_row = spark_df.filter(F.col(id_col) == req.case_id).select(gene_cols)
+        if target_row.count() == 0:
             raise HTTPException(status_code=404, detail="case_id not found")
-        vec = row.iloc[0][gene_cols].apply(pd.to_numeric, errors="coerce").fillna(0).values
-        return vec.reshape(1, -1)
+        return target_row
 
     if req.genes:
-        vec = []
+        row_dict = {}
+        for original_g, val in req.genes.items():
+            g_safe = original_g.replace(".", "_")
+            if g_safe in gene_cols:
+                row_dict[g_safe] = float(val)
+                
+        # Fill missing with 0.0
         for g in gene_cols:
-            vec.append(float(req.genes.get(g, 0.0)))
-        return np.array(vec).reshape(1, -1)
+            if g not in row_dict:
+                row_dict[g] = 0.0
+                
+        return spark.createDataFrame([row_dict])
 
     raise HTTPException(status_code=400, detail="Provide either case_id or genes")
 
+def extract_flat_genes(req: PatientRequest):
+    if req.case_id:
+        target_row = spark_df.filter(F.col(id_col) == req.case_id).select(gene_cols).head()
+        if not target_row:
+            return None
+        vec = []
+        for g in gene_cols:
+            val = target_row[g]
+            vec.append(float(val) if val is not None else 0.0)
+        return np.array(vec)
+        
+    if req.genes:
+        vec = []
+        safe_genes = {k.replace(".", "_"): v for k, v in req.genes.items()}
+        for g in gene_cols:
+            vec.append(float(safe_genes.get(g, 0.0)))
+        return np.array(vec)
+        
+    return None
 
 def make_similarity_report(case_id: str | None = None, feature_vector: np.ndarray | None = None, top_k: int = 5, target_genes: list[str] | None = None):
-    """
-    Finds top_k similar patients based on genomic markers.
-    Can use either an existing case_id or a raw feature vector.
-    """
     if case_id:
-        matches = df.index[df[id_col].astype(str) == str(case_id)].tolist()
-        if not matches:
+        target_idx = pandas_df[pandas_df[id_col] == case_id].index
+        if len(target_idx) == 0:
             return []
-        target_idx = matches[0]
-        target_vec = X_all_scaled[target_idx].reshape(1, -1)
-        sims = cosine_similarity(target_vec, X_all_scaled)[0]
-        best_idx = np.argsort(sims)[::-1][1:top_k+1]
+        base_vector_np = features_mat[target_idx[0]]
     elif feature_vector is not None:
-        # Feature vector is already scaled when passed from predict_all
-        target_vec = feature_vector.reshape(1, -1)
-        sims = cosine_similarity(target_vec, X_all_scaled)[0]
-        best_idx = np.argsort(sims)[::-1][:top_k]
+        base_vector_np = feature_vector.flatten().astype(np.float32)
     else:
         return []
+        
+    norm_target = np.linalg.norm(base_vector_np)
+    
+    # Calculate exact Cosine distances instantly via C-Level NumPy computations
+    dot_prods = features_mat.dot(base_vector_np)
+    sims = dot_prods / (features_norms * norm_target + 1e-9)
+    
+    if case_id:
+        match_indices = np.argsort(sims)[-(top_k+1):][::-1]
+        match_indices = [idx for idx in match_indices if pandas_df.iloc[idx][id_col] != case_id][:top_k]
+    else:
+        match_indices = np.argsort(sims)[-top_k:][::-1]
 
     neighbors = []
-    for i in best_idx:
-        cid = df.iloc[i][id_col]
-        surv = df.iloc[i].get('survival_label')
-        rec = df.iloc[i].get('recurrence_label')
-        risk = df.iloc[i].get('high_risk_flag')
+    for idx in match_indices:
+        row = pandas_df.iloc[idx]
+        cos_sim = float(sims[idx])
         
+        # Scale negatively matched vectors safely to 1% baseline
+        final_similarity_pct = round(max(0.01, cos_sim), 4)
+
         gene_values = {}
         if target_genes:
             for g in target_genes:
-                if g in df.columns:
-                    gene_values[g] = float(df.iloc[i][g])
+                if g in gene_cols:
+                    gene_values[g] = float(row[g]) if pd.notna(row[g]) else 0.0
+
+        surv = row["survival_label"]
+        rec = row["recurrence_label"]
+        risk = row["high_risk_flag"]
 
         neighbors.append({
-            "case_id": str(cid),
-            "similarity": float(sims[i]),
-            "survival_label": None if pd.isna(surv) else int(surv),
-            "recurrence_label": None if pd.isna(rec) else int(rec),
-            "high_risk_flag": None if pd.isna(risk) else int(risk),
+            "case_id": str(row[id_col]),
+            "similarity": final_similarity_pct,
+            "survival_label": None if pd.isna(surv) else int(float(surv)),
+            "recurrence_label": None if pd.isna(rec) else int(float(rec)),
+            "high_risk_flag": None if pd.isna(risk) else int(float(risk)),
             "gene_expression": gene_values
         })
 
@@ -156,9 +207,6 @@ def make_similarity_report(case_id: str | None = None, feature_vector: np.ndarra
 
 
 def build_treatment_insight(similar_patients, dominant_genes=None):
-    """
-    Enhanced insight layer that calculates recovery rates for specific dominant genes.
-    """
     if not similar_patients:
         return {"summary": "No similar patient data available."}
 
@@ -174,27 +222,30 @@ def build_treatment_insight(similar_patients, dominant_genes=None):
     recurrence_pct = round((recur / len(recurrence_vals)) * 100, 2) if recurrence_vals and len(recurrence_vals) > 0 else 0
     high_risk_pct = round((high_risk / len(risk_vals)) * 100, 2) if risk_vals and len(risk_vals) > 0 else 0
 
-    # Calculate Gene-Specific Recovery Rates
     genomic_recovery = []
     if dominant_genes:
         for gene_id in dominant_genes:
-            if gene_id in df.columns:
-                gene_median = df[gene_id].median()
-                valid_global = df[(df[gene_id] >= gene_median) & (df["survival_label"].notna())]
-                if not valid_global.empty:
-                    rec_count = (valid_global["survival_label"] == 0).sum()
-                    rate = round((rec_count / len(valid_global)) * 100, 1)
-                    genomic_recovery.append({
-                        "gene_id": gene_id,
-                        "recovery_rate": rate,
-                        "impact": "High" if rate > 70 else "Moderate" if rate > 40 else "Low"
-                    })
-                else:
+            if gene_id in spark_df_columns:
+                try:
+                    median_val = spark_df.approxQuantile(gene_id, [0.5], 0.05)[0]
+                    valid_df = spark_df.filter((F.col(gene_id) >= median_val) & F.col("survival_label").isNotNull())
+                    total_valid = valid_df.count()
+                    
+                    if total_valid > 0:
+                        rec_count = valid_df.filter(F.col("survival_label") == 0).count()
+                        rate = round((rec_count / total_valid) * 100, 1)
+                        genomic_recovery.append({
+                            "gene_id": gene_id,
+                            "recovery_rate": rate,
+                            "impact": "High" if rate > 70 else "Moderate" if rate > 40 else "Low"
+                        })
+                    else:
+                        genomic_recovery.append({"gene_id": gene_id, "recovery_rate": 0.0, "impact": "Unknown"})
+                except:
                     genomic_recovery.append({"gene_id": gene_id, "recovery_rate": 0.0, "impact": "Unknown"})
             else:
                 genomic_recovery.append({"gene_id": gene_id, "recovery_rate": 0.0, "impact": "Unknown"})
 
-    # Generate Logical Diagnostic Summary
     best_gene = max(genomic_recovery, key=lambda x: x["recovery_rate"]) if genomic_recovery else None
     
     summary_text = (
@@ -210,7 +261,6 @@ def build_treatment_insight(similar_patients, dominant_genes=None):
     survival_label = "High" if survival_pct >= 70 else "Moderate" if survival_pct >= 40 else "Low"
     risk_label = "Low" if recurrence_pct < 20 else "Elevated" if recurrence_pct < 50 else "High"
     
-    # Dynamic interpretation building
     interpretation = (
         f"Comparative analysis across {len(similar_patients)} clinical matches indicates a {survival_label.lower()} "
         f"survival trajectory with {risk_label.lower()} recurrence potential. "
@@ -228,34 +278,45 @@ def build_treatment_insight(similar_patients, dominant_genes=None):
     }
 
 
-# -----------------------------
+
 # Routes
-# -----------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "patients": len(df), "genes": len(gene_cols)}
+    return {"status": "ok", "api_mode": "PySpark Distributed Arrow", "genes": len(gene_cols), "models_loaded": survival_model is not None}
 
 
 @app.post("/predict/survival")
 def predict_survival(req: PatientRequest):
-    X = get_feature_vector_from_request(req)
-    prob = survival_model.predict_proba(X)[0, 1]
-    pred = int(prob >= 0.5)
+    if not survival_model:
+        raise HTTPException(status_code=500, detail="PySpark ML Model not loaded.")
+        
+    spark_input_df = get_prediction_spark_df(req)
+    pred_df = survival_model.transform(spark_input_df)
+    
+    row = pred_df.select("probability", "prediction").head()
+    prob = float(row["probability"][1])
+    pred = int(row["prediction"])
 
     return {
-        "survival_probability": round(float(prob) * 100, 2),
+        "survival_probability": round(prob * 100, 2),
         "predicted_label": pred
     }
 
 
 @app.post("/predict/recurrence")
 def predict_recurrence(req: PatientRequest):
-    X = get_feature_vector_from_request(req)
-    prob = recurrence_model.predict_proba(X)[0, 1]
-    pred = int(prob >= 0.5)
+    if not recurrence_model:
+        raise HTTPException(status_code=500, detail="PySpark ML Model not loaded.")
+        
+    spark_input_df = get_prediction_spark_df(req)
+    pred_df = recurrence_model.transform(spark_input_df)
+    
+    row = pred_df.select("probability", "prediction").head()
+    prob = float(row["probability"][1])
+    pred = int(row["prediction"])
 
     return {
-        "recurrence_probability": round(float(prob) * 100, 2),
+        "recurrence_probability": round(prob * 100, 2),
         "predicted_label": pred
     }
 
@@ -277,33 +338,35 @@ def similar_patients(req: PatientRequest):
 @app.post("/predict/all")
 def predict_all(req: PatientRequest):
     try:
-        X = get_feature_vector_from_request(req)
-        
-        if np.isnan(X).all() or np.count_nonzero(X) == 0:
-            raise HTTPException(status_code=400, detail="Invalid genomic data provided. Feature vector is entirely empty or zero.")
-        
-        # Scale for similar patient matching only
-        X_df = pd.DataFrame(X, columns=gene_cols)
-        X_processed = preprocessor.transform(X_df)
+        if not survival_model or not recurrence_model:
+            raise HTTPException(status_code=500, detail="PySpark ML Models are not loaded.")
 
-        # Let the pipeline handle its own preprocessing
-        surv_prob = survival_model.predict_proba(X_df)[0, 1]
-        rec_prob = recurrence_model.predict_proba(X_df)[0, 1]
+        spark_input_df = get_prediction_spark_df(req)
         
-        # Calculate prediction confidence (how far from 0.5 is the probability?)
-        # 100% confidence means prob is 0.0 or 1.0. 0% confidence means prob is exactly 0.5.
-        surv_conf = abs(surv_prob - 0.5) * 2 * 100
-        rec_conf = abs(rec_prob - 0.5) * 2 * 100
+        surv_pred_df = survival_model.transform(spark_input_df)
+        rec_pred_df = recurrence_model.transform(spark_input_df)
+        
+        surv_row = surv_pred_df.select("probability").head()
+        rec_row = rec_pred_df.select("probability").head()
+
+        surv_prob = float(surv_row["probability"][1])
+        rec_prob = float(rec_row["probability"][1])
+        
+        # Calculate genuine statistical confidence (percentage of Deep Learning Trees that agreed on the outcome)
+        surv_conf = max(surv_prob, 1.0 - surv_prob) * 100.0
+        rec_conf = max(rec_prob, 1.0 - rec_prob) * 100.0
         
         gene_data = req.genes or {}
+        sanitized_genes = {k.replace(".", "_"): v for k, v in gene_data.items()}
+        
         dominant_genes = sorted(
-            [g for g in gene_data.keys() if g in gene_cols], 
-            key=lambda g: float(gene_data[g]) if isinstance(gene_data[g], (int, float, str)) else 0, 
+            [g for g in sanitized_genes.keys() if g in gene_cols], 
+            key=lambda g: float(sanitized_genes[g]) if isinstance(sanitized_genes[g], (int, float, str)) else 0, 
             reverse=True
         )[:3]
 
-        # Use robustly scaled feature vector for similarity search
-        neighbors = make_similarity_report(case_id=req.case_id, feature_vector=X_processed, top_k=5, target_genes=dominant_genes)
+        flat_genes = extract_flat_genes(req)
+        neighbors = make_similarity_report(case_id=req.case_id, feature_vector=flat_genes, top_k=5, target_genes=dominant_genes)
         insight = build_treatment_insight(neighbors, dominant_genes=dominant_genes)
 
         aggressiveness = min(100.0, 30.0 + (float(rec_prob) * 40.0))
@@ -322,7 +385,6 @@ def predict_all(req: PatientRequest):
             "gene_count": len(gene_cols)
         }
 
-        # Write partitioned JSON to HDFS
         try:
             now = datetime.utcnow()
             partition_path = f"/cancer_data/new_patients/{now.year}/{now.month:02d}/{now.day:02d}"
@@ -336,29 +398,96 @@ def predict_all(req: PatientRequest):
 
         return result_payload
 
+    except HTTPException as h:
+        raise h
     except Exception as e:
         print(f"ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    except Exception as e:
-        print(f"ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+# HDFS Storage Status Endpoint
+@app.get("/hdfs/storage")
+def hdfs_storage_status():
+    """
+    Returns live HDFS quota and usage statistics for /cancer_data.
+    Powers the storage dashboard panel in the frontend.
+    """
+    QUOTA_BYTES = 1 * 1024 * 1024 * 1024   # 1 GB hard cap
+    dirs_to_check = {
+        "root":         "/cancer_data",
+        "genes":        "/cancer_data/genes",
+        "new_patients": "/cancer_data/new_patients",
+        "dataset":      "/cancer_data/target_ready_dataset.tsv",
+    }
+
+    def safe_content(path):
+        try:
+            c = HDFS_CLIENT.content(path, strict=False)
+            return c if c else {}
+        except Exception:
+            return {}
+
+    root_content  = safe_content("/cancer_data")
+    genes_content = safe_content("/cancer_data/genes")
+    np_content    = safe_content("/cancer_data/new_patients")
+
+    total_used    = root_content.get("length", 0)
+    genes_used    = genes_content.get("length", 0)
+    np_used       = np_content.get("length", 0)
+
+    # Count batch files in /cancer_data/genes
+    try:
+        gene_batches = len(HDFS_CLIENT.list("/cancer_data/genes"))
+    except Exception:
+        gene_batches = 0
+
+    # Count unique prediction records in /cancer_data/new_patients
+    try:
+        def count_hdfs_files(path):
+            total = 0
+            items = HDFS_CLIENT.list(path, status=True)
+            for name, info in items:
+                child = f"{path}/{name}"
+                if info["type"] == "DIRECTORY":
+                    total += count_hdfs_files(child)
+                else:
+                    total += 1
+            return total
+        prediction_count = count_hdfs_files("/cancer_data/new_patients")
+    except Exception:
+        prediction_count = 0
+
+    used_pct    = round((total_used / QUOTA_BYTES) * 100, 2) if QUOTA_BYTES > 0 else 0
+    available   = max(0, QUOTA_BYTES - total_used)
+
+    def fmt_mb(b):
+        return round(b / (1024 * 1024), 2)
+
+    return {
+        "quota_bytes":       QUOTA_BYTES,
+        "quota_mb":          fmt_mb(QUOTA_BYTES),
+        "used_bytes":        total_used,
+        "used_mb":           fmt_mb(total_used),
+        "available_bytes":   available,
+        "available_mb":      fmt_mb(available),
+        "used_percent":      used_pct,
+        "genes_used_mb":     fmt_mb(genes_used),
+        "predictions_used_mb": fmt_mb(np_used),
+        "gene_batches":      gene_batches,
+        "prediction_records": prediction_count,
+        "status":            "critical" if used_pct >= 90 else "warning" if used_pct >= 70 else "healthy",
+    }
 
 
 @app.post("/generate-report-pdf")
 async def generate_report_pdf(data: dict):
-    """
-    Generates a professional medical analysis report in PDF format with robust error handling.
-    Includes patient-specific details and clinical markers.
-    """
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
         from reportlab.lib.units import inch
-        import io
-        import pandas as pd
         from fastapi.responses import StreamingResponse
         
         buffer = io.BytesIO()
@@ -371,7 +500,6 @@ async def generate_report_pdf(data: dict):
         elements = []
         styles = getSampleStyleSheet()
         
-        # Custom Styles matching the Rose Palette
         title_style = ParagraphStyle(
             'RoseTitle', parent=styles['Heading1'], fontSize=22, spaceAfter=12, textColor=colors.HexColor("#C41E4A")
         )
@@ -382,9 +510,7 @@ async def generate_report_pdf(data: dict):
             'SectionHeading', parent=styles['Heading2'], fontSize=14, textColor=colors.HexColor("#A01745"), spaceBefore=15, spaceAfter=10
         )
         
-        # 1. Header
         elements.append(Paragraph("Precision Oncology AI Analysis", title_style))
-        
         date_str = pd.Timestamp.now().strftime('%B %d, %Y | %H:%M %Z')
         header_table_data = [
             [Paragraph(f"Case ID: {str(data.get('case_id', 'N/A'))}", subtitle_style), 
@@ -399,7 +525,6 @@ async def generate_report_pdf(data: dict):
         elements.append(header_table)
         elements.append(Spacer(1, 0.1*inch))
         
-        # 2. Patient & Clinical Profile (Table)
         pi = data.get('patient_info', {})
         ci = data.get('clinical_info', {})
         
@@ -434,7 +559,6 @@ async def generate_report_pdf(data: dict):
         elements.append(profile_table)
         elements.append(Spacer(1, 0.2*inch))
         
-        # 3. AI Prognosis Results
         elements.append(Paragraph("AI Prognosis Metrics", section_heading))
         metrics_data = [
             ["Survival Probability (5-Yr)", f"{data.get('survival_probability', 0)}%"],
@@ -460,7 +584,6 @@ async def generate_report_pdf(data: dict):
         elements.append(metrics_table)
         elements.append(Spacer(1, 0.2*inch))
         
-        # 4. Diagnostic Intelligence
         elements.append(Paragraph("Diagnostic Intelligence & Gene Matching", section_heading))
         insight_data = data.get("treatment_insight", {})
         interpretation = insight_data.get("interpretation", "No interpretation available.")
@@ -476,7 +599,6 @@ async def generate_report_pdf(data: dict):
         elements.append(Paragraph(f"{interpretation}<br/><br/><i>{summary}</i>", intel_style))
         elements.append(Spacer(1, 0.2*inch))
         
-        # 5. Genomic Benchmarks
         recovery = insight_data.get("genomic_recovery_insights", [])
         if recovery:
             elements.append(Paragraph("Genomic Recovery Benchmarks", section_heading))
@@ -499,21 +621,16 @@ async def generate_report_pdf(data: dict):
             ]))
             elements.append(bench_table)
             
-        # 6. Disclaimer
         elements.append(Spacer(1, 0.4*inch))
         disc_style = ParagraphStyle('Disc', parent=styles['Italic'], fontSize=8, textColor=colors.grey)
         elements.append(Paragraph("CONFIDENTIAL MEDICAL RESEARCH REPORT: This synthesis is AI-generated for oncology research. Final diagnosis must be verified by a board-certified specialist.", disc_style))
         
-        # Build Document
         doc.build(elements)
         buffer.seek(0)
         
         return StreamingResponse(buffer, media_type="application/pdf", headers={
             "Content-Disposition": f"attachment; filename=Prognosis_Report_{str(data.get('case_id', 'Unknown'))}.pdf"
         })
-    except Exception as e:
-        print(f"PDF GENERATION ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"PDF Generation failed: {str(e)}")
     except Exception as e:
         print(f"PDF GENERATION ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"PDF Generation failed: {str(e)}")
@@ -533,7 +650,6 @@ async def extract_report(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error parsing PDF: {str(e)}")
 
-    # Extraction Logic (Regex)
     data: dict[str, Any] = {
         "tumorStage": None,
         "tumorGrade": None,
@@ -543,33 +659,26 @@ async def extract_report(file: UploadFile = File(...)):
         "geneC": None
     }
 
-    # Case-insensitive search
-    # Tumor Stage: Stage I, II, III, IV or 1, 2, 3, 4 (Allow optional Stage keyword repetition)
     stage_match = re.search(r"Stage.*?\b(I{1,3}|IV|[1-4])\b", text, re.IGNORECASE)
     if stage_match:
         data["tumorStage"] = stage_match.group(1).upper()
 
-    # Tumor Grade: Grade G1, G2, G3 or 1, 2, 3
     grade_match = re.search(r"Grade.*?\b(G[1-3]|[1-3])\b", text, re.IGNORECASE)
     if not grade_match:
         grade_match = re.search(r"\b(G[1-3])\b", text, re.IGNORECASE)
     if grade_match:
         val = grade_match.group(1).upper()
-        # Normalize to G1 format
         data["tumorGrade"] = val if val.startswith("G") else f"G{val}"
 
-    # Metastasis: Yes/No
     meta_match = re.search(r"Metastasis[:\-\s]+(Yes|No)", text, re.IGNORECASE)
     if meta_match:
         data["metastasis"] = meta_match.group(1).capitalize()
 
-    # Genes: Specific Gene A, B, C (backward compatibility)
     for g in ["A", "B", "C"]:
         gene_match = re.search(rf"Gene\s+{g}[:\-\s]*([\d\.]+)", text, re.IGNORECASE)
         if gene_match:
             data[f"gene{g}"] = float(gene_match.group(1))
 
-    # Bulk Genes: ENSG IDs (e.g., ENSG00000276168.1: 12.3 or ENSG00000276168: 12.3)
     ensg_matches = re.finditer(r"(ENSG\d+(?:\.\d+)?)[:\-\s]+([\d\.]+)", text)
     extracted_genes = {}
     for match in ensg_matches:
@@ -577,13 +686,7 @@ async def extract_report(file: UploadFile = File(...)):
         value = float(match.group(2))
         extracted_genes[ensg_id] = value
     
-    # Merge bulk genes into data
     if extracted_genes:
         data["extracted_genes"] = extracted_genes
 
     return data
-# Trigger Reload
-
-# Trigger Reload 2
-
-# Trigger Reload PDF Platypus

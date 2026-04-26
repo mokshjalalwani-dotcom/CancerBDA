@@ -1,6 +1,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowRight, Activity, Shield, Users, Sparkles } from 'lucide-react';
+import HadoopStoragePanel from '../components/HadoopStoragePanel';
 
 const LandingPage = () => {
   const navigate = useNavigate();
@@ -39,7 +40,7 @@ const LandingPage = () => {
         </div>
 
         {/* Symmetric Features Grid */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.25rem' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.25rem', marginBottom: '1.5rem' }}>
           {[
             { icon: Activity, color: '#E56B8A', bg: 'rgba(196,30,74,0.08)', title: 'Survival Analysis', desc: '5-year survival from deep genomic profiling.' },
             { icon: Shield, color: '#F099AC', bg: 'rgba(229,107,138,0.08)', title: 'Recurrence Risk', desc: '94.2% precision using advanced ML models.' },
@@ -56,9 +57,13 @@ const LandingPage = () => {
             </div>
           ))}
         </div>
+
+        {/* Live HDFS Storage Status */}
+        <HadoopStoragePanel />
       </div>
     </div>
   );
 };
 
 export default LandingPage;
+

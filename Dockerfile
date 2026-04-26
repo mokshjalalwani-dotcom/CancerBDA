@@ -18,6 +18,12 @@ FROM python:3.10-slim AS runner
 
 WORKDIR /app
 
+# Install Java for PySpark JVM requirements
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    default-jre \
+    && rm -rf /var/lib/apt/lists/*
+
+
 # Copy installed python packages from builder
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin

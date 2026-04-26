@@ -70,10 +70,8 @@ if "survival_label" in df.columns:
 
     joblib.dump(best_surv_model, "survival_model.pkl")
 
-# ==========================
-# RECURRENCE MODEL
-# ==========================
 
+# RECURRENCE MODEL
 if "recurrence_label" in df.columns:
 
     # Fill missing recurrence labels with 0 to maintain binary classification
@@ -102,10 +100,8 @@ if "recurrence_label" in df.columns:
 
     joblib.dump(best_rec_model, "recurrence_model.pkl")
 
-# ==========================
-# PATIENT SIMILARITY ENGINE
-# ==========================
 
+# PATIENT SIMILARITY ENGINE
 print("\nBuilding Similarity Engine...")
 
 # Refit preprocessor on the entire dataset for similarity search

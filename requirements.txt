@@ -12,3 +12,5 @@ pdfplumber
 python-multipart
 reportlab==4.4.10
 hdfs
+pyspark==3.5.1
+pyarrow==15.0.2
